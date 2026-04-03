@@ -12,12 +12,13 @@ from spellchecker import SpellChecker
 device = torch.device("cpu")
 IMG_WIDTH = 128
 IMG_HEIGHT = 32
-TEST_SAMPLE_SIZE = 1000 
+TEST_SAMPLE_SIZE = 500 
 BEAM_SIZE = 3 
 
-WORDS_TXT_PATH = r"C:\Users\dikil\Desktop\proje\ascii\words.txt"
-IAM_LINES_PATH = r"C:\Users\dikil\Desktop\proje\ascii\lines.txt"
-WORDS_IMG_DIR = r"C:\Users\dikil\Desktop\proje\words\iam_dataset\words"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORDS_TXT_PATH = os.path.join(BASE_DIR, "ascii", "words.txt")
+IAM_LINES_PATH = os.path.join(BASE_DIR, "ascii", "lines.txt")
+WORDS_IMG_DIR = r"C:\Users\dikil\Desktop\crnn\words\iam_dataset\words"
 MODEL_PATH = "words_model_best.pth"
 
 class CRNN(nn.Module):
@@ -60,6 +61,9 @@ def decode_beam_search(preds, num_to_char, beam_size=3):
 def load_ultra_ngram_data(lines_path):
     print("Loading Trigram Data...")
     words = []
+    if not os.path.exists(lines_path):
+        print(f"Warning: {lines_path} not found")
+        return {}, {}, {}
     try:
         with open(lines_path, 'r') as f:
             for line in f:
@@ -68,120 +72,108 @@ def load_ultra_ngram_data(lines_path):
                 text = " ".join(parts[8:]).lower().replace("|", " ")
                 clean_text = re.sub(r'[^a-z\s]', '', text)
                 words.extend(clean_text.split())
-        
         trigrams = collections.Counter(zip(words, words[1:], words[2:]))
         bigrams = collections.Counter(zip(words, words[1:]))
         unigrams = collections.Counter(words)
         return trigrams, bigrams, unigrams
     except:
-        print("Dataset not found")
         return {}, {}, {}
 
-TRIGRAMS, BIGRAMS, UNIGRAMS = load_ultra_ngram_data(IAM_LINES_PATH)
-spell = SpellChecker()
-
-def smart_autocorrect_ultra(word, prev_word=None, prev_prev_word=None):
+def smart_autocorrect_ultra(word, trigrams, bigrams, unigrams, spell, prev_word=None, prev_prev_word=None):
     word = word.lower()
     if not word.isalpha() or len(word) < 2: return word
-    
-    if word in UNIGRAMS and UNIGRAMS[word] > 80:
-        return word
-        
+    if word in unigrams and unigrams[word] > 80: return word
     candidates = spell.candidates(word)
     if not candidates: return word
-    
-    best_cand = word
-    max_score = -1
-    
+    best_cand, max_score = word, -1
     for cand in candidates:
-        score = 0
-        if prev_word and prev_prev_word:
-            score += TRIGRAMS.get((prev_prev_word, prev_word, cand), 0) * 100
-        if prev_word:
-            score += BIGRAMS.get((prev_word, cand), 0) * 40
-        score += UNIGRAMS.get(cand, 0)
-        
+        score = unigrams.get(cand, 0)
+        if prev_word: score += bigrams.get((prev_word, cand), 0) * 40
+        if prev_word and prev_prev_word: score += trigrams.get((prev_prev_word, prev_word, cand), 0) * 100
         if score > max_score:
-            max_score = score
-            best_cand = cand
+            max_score, best_cand = score, cand
     return best_cand
 
 if __name__ == "__main__":
     if os.path.exists('alphabet.txt'):
-        with open('alphabet.txt', 'r', encoding='utf-8') as f: 
-            alphabet = f.read()
+        with open('alphabet.txt', 'r', encoding='utf-8') as f: alphabet = f.read()
     else:
         alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,!?'\"-() "
-        
     num_to_char = {i + 1: char for i, char in enumerate(alphabet)}
-    
+
     model = CRNN(len(alphabet)).to(device)
     if os.path.exists(MODEL_PATH):
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         model.eval()
+        print(f"Model loaded: {MODEL_PATH}")
     else:
-        print("Model file not found")
+        print(f"Error: Model file {MODEL_PATH} not found")
         exit()
 
-    def parse_words_txt(file_path):
-        words_list = []
-        with open(file_path, 'r') as f:
-            for line in f:
-                if line.startswith("#") or not line.strip(): continue
-                parts = line.split()
-                if parts[1] == "ok":
-                    img_id = parts[0]
-                    label = parts[-1] 
-                    words_list.append((img_id, label))
-        return words_list
+    TRIGRAMS, BIGRAMS, UNIGRAMS = load_ultra_ngram_data(IAM_LINES_PATH)
+    spell = SpellChecker()
 
-    all_words = parse_words_txt(WORDS_TXT_PATH)
-    test_words = random.sample(all_words, min(len(all_words), TEST_SAMPLE_SIZE))
-    
-    gercek_metinler, tahmin_edilenler = [], []
-    tam_eslesme_sayisi = 0
-    prev_label = None 
-    prev_prev_label = None
-
-    print(f"Starting test for {len(test_words)} words")
-
-    for idx, (img_id, gercek_label) in enumerate(test_words):
-        p = img_id.split('-')
-        path = os.path.join(WORDS_IMG_DIR, p[0], f"{p[0]}-{p[1]}", f"{img_id}.png")
-        if not os.path.exists(path): continue
+    if not os.path.exists(WORDS_TXT_PATH):
+        print(f"Error: {WORDS_TXT_PATH} not found")
+        exit()
         
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    words_list = []
+    with open(WORDS_TXT_PATH, 'r') as f:
+        for line in f:
+            if line.startswith("#") or not line.strip(): continue
+            parts = line.split()
+            if parts[1] == "ok":
+                words_list.append((parts[0], parts[-1]))
+
+    test_samples = random.sample(words_list, min(len(words_list), TEST_SAMPLE_SIZE))
+    actual_texts, predicted_texts = [], []
+    exact_match_count = 0
+    prev_label, prev_prev_label = None, None
+
+    print(f"Starting test for {len(test_samples)} words")
+
+    for idx, (img_id, target_label) in enumerate(test_samples):
+        p = img_id.split('-')
+        img_path = os.path.join(WORDS_IMG_DIR, p[0], f"{p[0]}-{p[1]}", f"{img_id}.png")
+        
+        if not os.path.exists(img_path):
+            continue
+        
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is None: continue
         img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
         img_tensor = torch.FloatTensor(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
             preds = model(img_tensor).log_softmax(2).permute(1, 0, 2)
-            ham_tahmin = decode_beam_search(preds, num_to_char, BEAM_SIZE)
-            akilli_tahmin = smart_autocorrect_ultra(ham_tahmin, prev_label, prev_prev_label)
+            raw_pred = decode_beam_search(preds, num_to_char, BEAM_SIZE)
+            final_pred = smart_autocorrect_ultra(raw_pred, TRIGRAMS, BIGRAMS, UNIGRAMS, spell, prev_label, prev_prev_label)
             
-        gercek_metinler.append(gercek_label.lower())
-        tahmin_edilenler.append(akilli_tahmin.lower())
+        actual_texts.append(target_label.lower())
+        predicted_texts.append(final_pred.lower())
         
-        if gercek_label.lower() == akilli_tahmin.lower():
-            tam_eslesme_sayisi += 1
+        if target_label.lower() == final_pred.lower():
+            exact_match_count += 1
         
-        prev_prev_label = prev_label
-        prev_label = akilli_tahmin 
+        prev_prev_label, prev_label = prev_label, final_pred
 
         if (idx+1) % 100 == 0:
-            print(f"Progress: [{idx+1}/{len(test_words)}]")
+            print(f"Processed: {idx+1}/{len(test_samples)}")
 
-    final_cer = cer(gercek_metinler, tahmin_edilenler)
-    final_wer = wer(gercek_metinler, tahmin_edilenler)
-    
-    print("\n" + "="*50)
-    print("FINAL ULTRA REPORT (TRIGRAM SUPPORTED)")
-    print("="*50)
-    print(f"Exact Match                  : {(tam_eslesme_sayisi/len(gercek_metinler))*100:.2f}%")
-    print(f"Word Accuracy                : {(1-final_wer)*100:.2f}%")
-    print(f"Character Accuracy (1 - CER) : {(1-final_cer)*100:.2f}%")
-    print("-" * 50)
-    print(f"Word Error Rate (WER)        : {final_wer * 100:.2f}%")
-    print(f"Character Error Rate (CER)   : {final_cer * 100:.2f}%")
-    print("="*50)
+    if len(actual_texts) > 0:
+        final_cer = cer(actual_texts, predicted_texts)
+        final_wer = wer(actual_texts, predicted_texts)
+        
+        print("\n" + "="*50)
+        print("FINAL EVALUATION REPORT")
+        print("="*50)
+        print(f"Samples Successfully Tested  : {len(actual_texts)}")
+        print(f"Exact Match Accuracy         : {(exact_match_count/len(actual_texts))*100:.2f}%")
+        print(f"Word Accuracy (1-WER)        : {(1-final_wer)*100:.2f}%")
+        print(f"Character Accuracy (1-CER)   : {(1-final_cer)*100:.2f}%")
+        print("-" * 50)
+        print(f"Word Error Rate (WER)        : {final_wer * 100:.2f}%")
+        print(f"Character Error Rate (CER)   : {final_cer * 100:.2f}%")
+        print("="*50)
+    else:
+        print("\nError: No images were found at:", WORDS_IMG_DIR)
